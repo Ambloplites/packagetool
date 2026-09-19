@@ -1,3 +1,3 @@
-module github.com/YoshihikoAbe/packagetool
+module github.com/Ambloplites/packagetool
 
 go 1.22.3

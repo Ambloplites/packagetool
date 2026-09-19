@@ -7,7 +7,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/YoshihikoAbe/packagetool"
+	"github.com/Ambloplites/packagetool"
 )
 
 func main() {
