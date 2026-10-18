@@ -6,82 +6,96 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"iter"
 	"math/bits"
 )
 
-type MarReader struct {
-	UseDecryption bool
+type marBackend struct {
+	useDecryption bool
 }
 
-func (MarReader) Name() string {
+func (marBackend) name() string {
 	return "MAR"
 }
 
-func (mar MarReader) Read(rd Reader, cb func(File) error) error {
-	b := make([]byte, 128)
+func (marBackend) probe(head [4]byte) bool {
+	return string(head[:]) == "MASM"
+}
 
-	// read magic
-	magic := b[:8]
-	io.ReadFull(rd, magic)
-	if string(magic) != "MASMAR0\x00" {
-		return errMagic
-	}
+func (marBackend) read(rd *readerAtOffset) iter.Seq2[*FileMetadata, error] {
+	return func(yield func(*FileMetadata, error) bool) {
+		b := make([]byte, 128)
 
-	for {
-		t, err := rd.ReadByte()
-		if err != nil {
-			return err
+		// read the rest of the magic
+		magic := b[:4]
+		if _, err := io.ReadFull(rd, magic); err != nil {
+			yield(nil, err)
+			return
+		}
+		if string(magic) != "AR0\x00" {
+			yield(nil, errors.New("invalid MAR magic"))
+			return
 		}
 
-		// EOF
-		if t == 255 {
-			return nil
-		}
-
-		// read filename
-		size, err := readNullTerminated(b, rd)
-		if err != nil {
-			return err
-		}
-		filename := string(b[:size])
-
-		if t == 1 {
-			// read file size
-			if _, err := io.ReadFull(rd, b[:4]); err != nil {
-				return err
+		for {
+			// read file type
+			if _, err := io.ReadFull(rd, b[:1]); err != nil {
+				yield(nil, err)
+				return
 			}
-			size := binary.LittleEndian.Uint32(b)
-
-			fileReader := io.LimitReader(rd, int64(size))
-			if mar.UseDecryption {
-				fileReader = newEncryptedMarReader(fileReader, []byte(filename))
+			t := b[0]
+			if t == 255 {
+				break
 			}
 
-			if err := cb(File{
-				Reader:   fileReader,
-				Filename: filename,
-			}); err != nil {
-				return err
+			// read file name
+			n, err := rd.Read(b)
+			if err != nil && err != io.EOF {
+				yield(nil, err)
+				return
 			}
-		} else if t != 2 {
-			return fmt.Errorf("invalid file type: %d", t)
+			cleanPath, realPath, err := normalizePath(b[:n], 0)
+			if err != nil && err != io.EOF {
+				yield(nil, err)
+				return
+			}
+			rd.offset += int64(len(realPath) + 1 - n)
+
+			if t == 1 {
+				// read file size
+				if _, err := io.ReadFull(rd, b[:4]); err != nil {
+					yield(nil, err)
+					return
+				}
+				size := int64(binary.LittleEndian.Uint32(b))
+
+				if !yield(&FileMetadata{
+					realPath:  realPath,
+					cleanPath: cleanPath,
+					offset:    rd.offset,
+					size:      size,
+				}, nil) {
+					return
+				}
+				rd.offset += size
+			} else if t != 2 {
+				yield(nil, fmt.Errorf("invalid file type: %d", t))
+				return
+			}
 		}
 	}
 }
 
-func readNullTerminated(out []byte, rd io.ByteReader) (int, error) {
-	for i := range out {
-		b, err := rd.ReadByte()
-		if err != nil {
-			return 0, err
+func (mar marBackend) makeReader(entry *FileMetadata, rd io.Reader) io.Reader {
+	if mar.useDecryption {
+		realPath := []byte(entry.realPath)
+		rd = &encryptedMarReader{
+			rd:    rd,
+			key32: crc32.ChecksumIEEE(realPath),
+			key16: crc16(realPath),
 		}
-
-		if b == 0 {
-			return i, nil
-		}
-		out[i] = b
 	}
-	return 0, errors.New("filename too long")
+	return rd
 }
 
 type encryptedMarReader struct {
@@ -90,18 +104,10 @@ type encryptedMarReader struct {
 	key    [4]byte
 	key32  uint32
 	key16  uint16
-	unread [1024]byte
+	unread [8192]byte
 	head   int
 	tail   int
 	err    error
-}
-
-func newEncryptedMarReader(rd io.Reader, filename []byte) *encryptedMarReader {
-	return &encryptedMarReader{
-		rd:    rd,
-		key32: crc32.ChecksumIEEE(filename),
-		key16: crc16(filename),
-	}
 }
 
 func (enc *encryptedMarReader) Read(b []byte) (n int, err error) {
@@ -114,7 +120,7 @@ func (enc *encryptedMarReader) Read(b []byte) (n int, err error) {
 			if err := enc.refill(); err != nil {
 				enc.err = err
 				if err != io.EOF {
-					break
+					return n, err
 				}
 			}
 		}
@@ -129,12 +135,14 @@ func (enc *encryptedMarReader) Read(b []byte) (n int, err error) {
 		n += size
 		b = b[size:]
 	}
+
 	return
 }
 
 func (enc *encryptedMarReader) refill() (err error) {
 	enc.head = 0
 	enc.tail = 0
+
 	// some readers will ocassionally read less bytes than
 	// they should be able to, and because early partial reads
 	// break the key generation code, we have to do this

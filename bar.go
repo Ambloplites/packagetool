@@ -1,53 +1,71 @@
 package packagetool
 
 import (
-	"bytes"
 	"encoding/binary"
 	"io"
+	"iter"
 )
 
-type BarReader struct{}
+type barBackend struct{}
 
-func (BarReader) Name() string {
+func (barBackend) name() string {
 	return "BAR"
 }
 
-func (BarReader) Read(rd Reader, cb func(File) error) error {
-	b := make([]byte, 256)
+func (barBackend) probe(head [4]byte) bool {
+	return head[3] == 'A'
+}
 
-	// read header
-	if _, err := io.ReadFull(rd, b[:12]); err != nil {
-		return err
+func (barBackend) read(rd *readerAtOffset) iter.Seq2[*FileMetadata, error] {
+	return func(yield func(*FileMetadata, error) bool) {
+		const filenameSize = 252
+		b := make([]byte, 264)
+
+		// read header
+		if _, err := io.ReadFull(rd, b[:8]); err != nil {
+			yield(nil, err)
+			return
+		}
+
+		count := binary.LittleEndian.Uint16(b[6:])
+		for range count {
+			// read filename and the weird thing
+			if _, err := io.ReadFull(rd, b[:filenameSize+4]); err != nil {
+				yield(nil, err)
+				return
+			}
+			cleanPath, realPath, err := normalizePath(b[:filenameSize], replaceBackslash)
+			if err != nil {
+				yield(nil, err)
+				return
+			}
+
+			// for weird files
+			if binary.LittleEndian.Uint32(b[filenameSize:]) != 3 {
+				// skip
+				rd.offset += 4
+			}
+
+			// read file size
+			if _, err := io.ReadFull(rd, b[filenameSize:]); err != nil {
+				yield(nil, err)
+				return
+			}
+			size := int64(binary.LittleEndian.Uint64(b[filenameSize+4:]))
+
+			if !yield(&FileMetadata{
+				cleanPath: cleanPath,
+				realPath:  realPath,
+				offset:    rd.offset,
+				size:      size,
+			}, nil) {
+				return
+			}
+			rd.offset += size
+		}
 	}
+}
 
-	entries := binary.LittleEndian.Uint16(b[10:])
-	for i := uint16(0); i < entries; i++ {
-		// read filename
-		if _, err := io.ReadFull(rd, b); err != nil {
-			return err
-		}
-		nameData, _, _ := bytes.Cut(b, []byte{0})
-		name := string(nameData)
-
-		// for weird files
-		if binary.LittleEndian.Uint32(b[252:]) != 3 {
-			// skip
-			io.ReadFull(rd, b[:4])
-		}
-
-		// read file metadata
-		if _, err := io.ReadFull(rd, b[:12]); err != nil {
-			return err
-		}
-		size := binary.LittleEndian.Uint64(b[4:])
-
-		if err := cb(File{
-			Reader:   io.LimitReader(rd, int64(size)),
-			Filename: name,
-		}); err != nil {
-			return err
-		}
-	}
-
-	return nil
+func (barBackend) makeReader(entry *FileMetadata, rd io.Reader) io.Reader {
+	return rd
 }
